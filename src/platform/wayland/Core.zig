@@ -1100,10 +1100,9 @@ pub fn appUpdateThread(self: *Core, app: anytype) void {
 
     self.frame.start() catch unreachable;
     while (true) {
-        if (self.global_state.swap_chain_update.isSet()) { // blk: {
+        if (self.global_state.swap_chain_update.isSet()) blk: {
             self.global_state.swap_chain_update.reset();
 
-            //TODO
             // if (self.current_vsync_mode != self.last_vsync_mode) {
             //     self.last_vsync_mode = self.current_vsync_mode;
             //     switch (self.current_vsync_mode) {
@@ -1112,12 +1111,14 @@ pub fn appUpdateThread(self: *Core, app: anytype) void {
             //     }
             // }
 
-            //TODO
-            // if (self.current_size.width == 0 or self.current_size.height == 0) break :blk;
+            // Dont create a new swapchain if the new window size is 0 in either direction
+            if (self.global_state.window_size.current.width == 0 or self.global_state.window_size.current.height == 0) break :blk;
 
             self.global_state.swap_chain_mu.lock();
             defer self.global_state.swap_chain_mu.unlock();
+            //Release the old swapchain
             mach_core.swap_chain.release();
+            //Create the new swapchain
             self.swap_chain_desc.width = self.global_state.window_size.current.width;
             self.swap_chain_desc.height = self.global_state.window_size.current.height;
             self.swap_chain = self.gpu_device.createSwapChain(self.surface, &self.swap_chain_desc);
