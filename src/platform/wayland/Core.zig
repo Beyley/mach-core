@@ -36,6 +36,7 @@ pub const c = @cImport({
     @cInclude("wayland-relative-pointer-unstable-v1-client-protocol.h");
     @cInclude("wayland-pointer-constraints-unstable-v1-client-protocol.h");
     @cInclude("wayland-idle-inhibit-unstable-v1-client-protocol.h");
+    @cInclude("wayland-tearing-control-staging-v1-client-protocol.h");
     @cInclude("xkbcommon/xkbcommon.h");
     @cInclude("xkbcommon/xkbcommon-compose.h");
     @cInclude("linux/input-event-codes.h");
@@ -178,6 +179,7 @@ const Interfaces = struct {
     // zwp_pointer_constraints_v1: *c.zwp_pointer_constraints_v1,
     // zwp_idle_inhibit_manager_v1: *c.zwp_idle_inhibit_manager_v1,
     // xdg_activation_v1: *c.xdg_activation_v1,
+    wp_tearing_control_manager_v1: ?*c.wp_tearing_control_manager_v1 = null,
 };
 
 fn Changable(comptime T: type, comptime uses_allocator: bool) type {
@@ -279,6 +281,7 @@ const GlobalState = struct {
     configured: bool,
     interfaces: Interfaces,
     surface: ?*c.struct_wl_surface,
+    tearing_control: ?*c.wp_tearing_control_v1,
 
     // Input/Event stuff
     keyboard: ?*c.wl_keyboard = null,
@@ -294,6 +297,7 @@ const GlobalState = struct {
     window_size_mu: std.Thread.RwLock = .{},
     window_size: Changable(Size, false),
     swap_chain_update: std.Thread.ResetEvent = .{},
+    vsync: Changable(bool, false),
 
     // Mutable fields; written by the App.update thread, read from any
     swap_chain_mu: std.Thread.RwLock = .{},
@@ -324,7 +328,12 @@ global_state: GlobalState,
 
 // internal tracking state
 app_update_thread_started: bool = false,
+app_update_thread_wanted: bool = false,
+close_update_thread: std.Thread.ResetEvent = .{},
 done: std.Thread.ResetEvent = .{},
+app_update_thread: ?std.Thread = null,
+frame_callback_requested: bool = false,
+frame_callback_app_ptr: *anyopaque = undefined,
 
 //timings
 frame: *Frequency,
@@ -414,6 +423,14 @@ fn registryHandleGlobal(user_data: *GlobalState, registry: ?*c.struct_wl_registr
             .capabilities = @ptrCast(&seatHandleCapabilities),
             .name = @ptrCast(&seatHandleName), //ptrCast for the `[*:0]const u8`
         }, user_data);
+    } else if (std.mem.eql(u8, "wp_tearing_control_manager_v1", interface)) {
+        user_data.interfaces.wp_tearing_control_manager_v1 = @ptrCast(c.wl_registry_bind(
+            registry,
+            name,
+            &c.wp_tearing_control_manager_v1_interface,
+            @min(3, version),
+        ) orelse @panic("uh idk how to proceed"));
+        log.debug("Bound wp_tearing_control_manager_v1 :)", .{});
     }
 }
 
@@ -829,7 +846,9 @@ pub fn init(
             .shift = false,
             .super = false,
         },
+        .tearing_control = null,
         .window_size = try @TypeOf(core.global_state.window_size).init(options.size, {}),
+        .vsync = try @TypeOf(core.global_state.vsync).init(false, {}),
     };
 
     libwaylandclient = try LibWaylandClient.load();
@@ -885,6 +904,10 @@ pub fn init(
         .configure = @ptrCast(&xdgToplevelHandleConfigure),
         .close = @ptrCast(&xdgToplevelHandleClose),
     }, &core.global_state);
+
+    if (core.global_state.interfaces.wp_tearing_control_manager_v1) |wp_tearing_control_manager_v1| {
+        core.global_state.tearing_control = c.wp_tearing_control_manager_v1_get_tearing_control(wp_tearing_control_manager_v1, core.global_state.surface);
+    }
 
     //Commit changes to surface
     c.wl_surface_commit(core.global_state.surface);
@@ -1011,20 +1034,70 @@ pub fn init(
         .swap_chain_desc = swap_chain_desc,
         .surface = surface,
     };
+
+    //Start the frame frequency
+    core.frame.start() catch unreachable;
+
+    //We never want an update thread if we have tearing control
+    if (core.global_state.vsync.current or core.global_state.interfaces.wp_tearing_control_manager_v1 != null) {
+        core.app_update_thread_wanted = false;
+    } else {
+        core.app_update_thread_wanted = true;
+    }
 }
 
 pub fn deinit(self: *Core) void {
+    self.app_update_thread_wanted = false;
+
+    //Join the app update thread
+    if (self.app_update_thread) |app_update_thread|
+        app_update_thread.join();
+
     self.title.deinit();
+
+    self.global_state.events.deinit();
 }
 
 // Called on the main thread
 pub fn update(self: *Core, app: anytype) !bool {
     if (self.done.isSet()) return true;
 
-    if (!self.app_update_thread_started) {
-        self.app_update_thread_started = true;
-        const thread = try std.Thread.spawn(.{}, appUpdateThread, .{ self, app });
-        thread.detach();
+    //If the separate app update thread is wanted
+    if (self.app_update_thread_wanted) {
+        //And it is not started, spawn the app update thread
+        if (!self.app_update_thread_started) {
+            log.debug("thread started", .{});
+
+            self.app_update_thread_started = true;
+
+            self.app_update_thread = try std.Thread.spawn(.{}, appUpdateThread, .{ self, app });
+        }
+    } else {
+        //If it is not wanted and it is started, join it and wait for it to exit
+        if (self.app_update_thread) |app_update_thread| {
+            //If the app update thread is still started, join it
+            app_update_thread.join();
+            self.app_update_thread_started = false;
+            self.app_update_thread = null;
+        }
+
+        if (!self.frame_callback_requested) {
+            log.debug("callback requested", .{});
+
+            self.frame_callback_requested = true;
+
+            self.frame_callback_app_ptr = app;
+
+            const cb = c.wl_surface_frame(self.global_state.surface);
+            _ = c.wl_callback_add_listener(cb, &.{
+                .done = @ptrCast(&FrameCallbackComptime(@TypeOf(app)).frameCallback), //ptrCast for user_data: ?*anyopaque -> self: *Core
+            }, self);
+
+            // c.wl_surface_damage(self.global_state.surface, 0, 0, std.math.maxInt(c_int), std.math.maxInt(c_int));
+            c.wl_surface_commit(self.global_state.surface);
+
+            _ = appUpdateTick(self, app);
+        }
     }
 
     //State updates
@@ -1039,6 +1112,28 @@ pub fn update(self: *Core, app: anytype) !bool {
             defer self.title.freeLast();
 
             c.xdg_toplevel_set_title(self.toplevel, new_title);
+        }
+
+        if (self.global_state.vsync.read()) |new_vsync| {
+            if (self.global_state.tearing_control != null) {
+                self.app_update_thread_wanted = false;
+
+                const mode: u32 = if (new_vsync)
+                    c.WP_TEARING_CONTROL_V1_PRESENTATION_HINT_VSYNC
+                else
+                    c.WP_TEARING_CONTROL_V1_PRESENTATION_HINT_ASYNC;
+
+                std.debug.print("new mode: {d}\n", .{mode});
+
+                c.wp_tearing_control_v1_set_presentation_hint(
+                    self.global_state.tearing_control,
+                    mode,
+                );
+
+                need_surface_commit = true;
+            } else {
+                self.app_update_thread_wanted = !new_vsync;
+            }
         }
 
         // Check if we have a new min size
@@ -1094,59 +1189,106 @@ pub fn update(self: *Core, app: anytype) !bool {
     return false;
 }
 
+fn FrameCallbackComptime(comptime T: type) type {
+    return struct {
+        fn frameCallback(self: *Core, old_cb: ?*c.struct_wl_callback, time: u32) callconv(.C) void {
+            // log.debug("frame callback", .{});
+            _ = time;
+
+            c.wl_callback_destroy(old_cb);
+
+            const tick_res = if (!self.app_update_thread_wanted)
+                appUpdateTick(self, @as(T, @ptrCast(@alignCast(self.frame_callback_app_ptr))))
+            else
+                false;
+
+            //If the app update says to stop, stop
+            if (tick_res) {
+                self.frame_callback_requested = false;
+                return;
+            }
+
+            //If we dont want an app update thread
+            if (!self.app_update_thread_wanted) {
+                // log.debug("requested callback2", .{});
+
+                const cb = c.wl_surface_frame(self.global_state.surface);
+                _ = c.wl_callback_add_listener(cb, &.{
+                    .done = @ptrCast(&frameCallback), //ptrCast for user_data: ?*anyopaque -> self: *Core
+                }, self);
+
+                // c.wl_surface_damage(self.global_state.surface, 0, 0, std.math.maxInt(c_int), std.math.maxInt(c_int));
+                c.wl_surface_commit(self.global_state.surface);
+
+                self.frame_callback_requested = true;
+            } else {
+                self.frame_callback_requested = false;
+            }
+        }
+    };
+}
+
+fn appUpdateTick(self: *Core, app: anytype) bool {
+    self.frame.target = 0;
+
+    if (self.global_state.swap_chain_update.isSet()) blk: {
+        self.global_state.swap_chain_update.reset();
+
+        // if (self.current_vsync_mode != self.last_vsync_mode) {
+        //     self.last_vsync_mode = self.current_vsync_mode;
+        //     switch (self.current_vsync_mode) {
+        //         .triple => self.frame.target = 2 * self.refresh_rate,
+        //         else => self.frame.target = 0,
+        //     }
+        // }
+
+        // Dont create a new swapchain if the new window size is 0 in either direction
+        if (self.global_state.window_size.current.width == 0 or self.global_state.window_size.current.height == 0) break :blk;
+
+        self.global_state.swap_chain_mu.lock();
+        defer self.global_state.swap_chain_mu.unlock();
+        //Release the old swapchain
+        mach_core.swap_chain.release();
+        //Create the new swapchain
+        self.swap_chain_desc.width = self.global_state.window_size.current.width;
+        self.swap_chain_desc.height = self.global_state.window_size.current.height;
+        self.swap_chain = self.gpu_device.createSwapChain(self.surface, &self.swap_chain_desc);
+
+        mach_core.swap_chain = self.swap_chain;
+        mach_core.descriptor = self.swap_chain_desc;
+
+        self.global_state.pushEvent(.{
+            .framebuffer_resize = .{
+                .width = self.global_state.window_size.current.width,
+                .height = self.global_state.window_size.current.height,
+            },
+        });
+    }
+
+    if (app.update() catch unreachable) {
+        self.done.set();
+
+        // Wake the main thread from any event handling, so there is not e.g. a one second delay
+        // in exiting the application.
+        // self.wakeMainThread();
+        return true;
+    }
+    self.gpu_device.tick();
+    self.gpu_device.machWaitForCommandsToBeScheduled();
+
+    self.frame.tick();
+    if (self.frame.delay_ns != 0) std.time.sleep(self.frame.delay_ns);
+
+    return false;
+}
+
 // Secondary app-update thread
 pub fn appUpdateThread(self: *Core, app: anytype) void {
-    // @panic("TODO: implement appUpdateThread for Wayland");
-
-    self.frame.start() catch unreachable;
-    while (true) {
-        if (self.global_state.swap_chain_update.isSet()) blk: {
-            self.global_state.swap_chain_update.reset();
-
-            // if (self.current_vsync_mode != self.last_vsync_mode) {
-            //     self.last_vsync_mode = self.current_vsync_mode;
-            //     switch (self.current_vsync_mode) {
-            //         .triple => self.frame.target = 2 * self.refresh_rate,
-            //         else => self.frame.target = 0,
-            //     }
-            // }
-
-            // Dont create a new swapchain if the new window size is 0 in either direction
-            if (self.global_state.window_size.current.width == 0 or self.global_state.window_size.current.height == 0) break :blk;
-
-            self.global_state.swap_chain_mu.lock();
-            defer self.global_state.swap_chain_mu.unlock();
-            //Release the old swapchain
-            mach_core.swap_chain.release();
-            //Create the new swapchain
-            self.swap_chain_desc.width = self.global_state.window_size.current.width;
-            self.swap_chain_desc.height = self.global_state.window_size.current.height;
-            self.swap_chain = self.gpu_device.createSwapChain(self.surface, &self.swap_chain_desc);
-
-            mach_core.swap_chain = self.swap_chain;
-            mach_core.descriptor = self.swap_chain_desc;
-
-            self.global_state.pushEvent(.{
-                .framebuffer_resize = .{
-                    .width = self.global_state.window_size.current.width,
-                    .height = self.global_state.window_size.current.height,
-                },
-            });
-        }
-
-        if (app.update() catch unreachable) {
-            self.done.set();
-
-            // Wake the main thread from any event handling, so there is not e.g. a one second delay
-            // in exiting the application.
-            // self.wakeMainThread();
-            return;
-        }
-        self.gpu_device.tick();
-        self.gpu_device.machWaitForCommandsToBeScheduled();
-
-        self.frame.tick();
-        if (self.frame.delay_ns != 0) std.time.sleep(self.frame.delay_ns);
+    //Only run ticks from this thread if the app update thread is wanted
+    while (self.app_update_thread_wanted) {
+        //If the app update thread wants to exit out, lets exit out
+        if (appUpdateTick(self, app))
+            break;
     }
 }
 
@@ -1194,13 +1336,19 @@ pub fn headless(_: *Core) bool {
 }
 
 // May be called from any thread.
-pub fn setVSync(_: *Core, _: VSyncMode) void {
-    @panic("TODO: implement setVSync for Wayland");
+pub fn setVSync(self: *Core, mode: VSyncMode) void {
+    self.global_state.state_mu.lock();
+    defer self.global_state.state_mu.unlock();
+
+    switch (mode) {
+        .none => self.global_state.vsync.set(false) catch unreachable,
+        .double, .triple => self.global_state.vsync.set(true) catch unreachable,
+    }
 }
 
 // May be called from any thread.
-pub fn vsync(_: *Core) VSyncMode {
-    @panic("TODO: implement vsync for Wayland");
+pub fn vsync(self: *Core) VSyncMode {
+    return if (self.global_state.vsync.current) .double else .none;
 }
 
 // May be called from any thread.

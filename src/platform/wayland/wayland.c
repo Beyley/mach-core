@@ -5,3 +5,4 @@
 #include "wayland-relative-pointer-unstable-v1-client-protocol-code.h"
 #include "wayland-pointer-constraints-unstable-v1-client-protocol-code.h"
 #include "wayland-idle-inhibit-unstable-v1-client-protocol-code.h"
+#include "wayland-tearing-control-staging-v1-client-protocol-code.h"
